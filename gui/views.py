@@ -3350,7 +3350,7 @@ def chan_policy(request):
                 stub = lnrpc.LightningStub(lnd_connect())
                 version = stub.GetInfo(ln.GetInfoRequest()).version
                 kwargs = {'chan_point':channel_point, 'base_fee_msat':base_fee_msat, 'fee_rate':fee_rate, 'time_lock_delta':time_lock_delta, 'min_htlc_msat_specified':True, 'min_htlc_msat':min_htlc_msat, 'max_htlc_msat':max_htlc_msat}
-                if serializer.validated_data['inbound_base_fee'] or serializer.validated_data['inbound_fee_rate']:
+                if serializer.validated_data['inbound_base_fee'] is not None or serializer.validated_data['inbound_fee_rate'] is not None:
                     if float(version[:4]) >= 0.18:
                         kwargs['inbound_fee'] = ln.InboundFee(base_fee_msat = inbound_base_fee_msat if inbound_base_fee_msat else 0, fee_rate_ppm = inbound_fee_rate if inbound_fee_rate else 0)
                     else:
