@@ -205,6 +205,7 @@
         <th width=5%>Opener</th>
         <th width=4%>iTarget%</th>
         <th width=4%>AR</th>
+        <th width=3%>Actions</th>
       </tr>
     </thead>
     <tbody id="inactive_channels"></tbody>
@@ -507,7 +508,31 @@
     "local_chan_reserve": ch => ({innerHTML: ch.local_chan_reserve.intcomma()}),
     "last_update": ch =>  ({innerHTML: formatDate(ch.last_update).replace(" ago", ""), title: adjustTZ(ch.last_update)}),
     "initiator": ch => ({innerHTML: ch.initiator ? 'Local': 'Remote'}),
-  }, {ar_in_target, auto_rebalance})
+  }, {ar_in_target, auto_rebalance}, {
+    "actions": ch => ({
+      innerHTML: `
+        <!-- dummy first-child so .w3-dropdown-hover:first-child does not apply -->
+        <span style="display:none"></span>
+        <div class="w3-dropdown-hover" style="position:relative">
+          <button type="button"
+                  title="Actions"
+                  style="padding:4px 11px; line-height:1; font-size:18px; min-width:30px;
+                         border:none; border-radius:6px; cursor:pointer;
+                         background:inherit; color:inherit;">
+            ⋮
+          </button>
+          <div class="w3-dropdown-content w3-bar-block w3-card-4 w3-border" 
+               style="position:absolute;right:0;z-index:100;min-width:160px">
+            <button onclick="prefillClose('${ch.chan_id}')" 
+                    class="w3-bar-item w3-button w3-hover-red">
+              Close Channel
+            </button>
+            <!-- Add more actions here later -->
+          </div>
+        </div>
+      `
+    })
+  })
 
   let {local_commit, local_chan_reserve, initiator} = inactive_ch_template
   const private_ch_template = Object.assign({}, home_ch_base, {
@@ -937,6 +962,14 @@
     const table = byId(id.split(" ").join("_").toLowerCase()), template = use(template_arg)
     table.innerHTML = null
     channels.forEach(ch => table.append(template.render(ch)))
+  }
+  function prefillClose(chan_id) {
+    const el = byId('chan_id');
+    if (el) {
+      el.value = chan_id;
+      el.focus();
+      el.closest('form')?.scrollIntoView({ behavior: 'smooth' }) || el.scrollIntoView({ behavior: 'smooth' });
+    }
   }
   async function buildMain() {
     const node_info = await GET('node_info', {data: {limit:1}})
