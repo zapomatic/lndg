@@ -235,7 +235,7 @@ def logs(request):
         try:
             count = request.GET.get('tail', 20)
             grep = request.GET.get('grep', None)
-            logfile = '/var/log/lndg-controller.log'
+            logfile = 'data/lndg-controller.log'
             file_size = path.getsize(logfile)-2
             if file_size == 0:
                 logs = ['Logs are empty....']
@@ -2627,6 +2627,11 @@ class FailedHTLCViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = FailedHTLCs.objects.all().order_by('-id')
     serializer_class = FailedHTLCSerializer
     filterset_class = FailedHTLCFilter
+
+class HistFailedHTLCViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsAuthenticated] if settings.LOGIN_REQUIRED else []
+    queryset = HistFailedHTLC.objects.all().order_by('-id')
+    serializer_class = HistFailedHTLCSerializer
 
 class LocalSettingsViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated] if settings.LOGIN_REQUIRED else []

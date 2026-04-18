@@ -30,6 +30,29 @@ def _get_self_pubkey(stub):
     return _SELF_PUBKEY
 
 def update_payments(stub):
+    # Detect if index out of sync and resync if required
+    last_payment_index = stub.ListPayments(ln.ListPaymentsRequest(include_incomplete=True, reversed=True, max_payments=1)).payments[0].payment_index
+    last_db_payment_index = Payments.objects.aggregate(Max('index'))['index__max'] or 0
+    if last_payment_index is not None and last_db_payment_index > last_payment_index:
+        logger.warning(f'Payment data index greater than LND index, payment reindexing triggered')
+        Payments.objects.all().update(index=0)
+        page_size = 300
+        index_offset = 0
+        while True:
+            resp = stub.ListPayments(ln.ListPaymentsRequest(
+                include_incomplete=True,
+                index_offset=index_offset,
+                max_payments=page_size
+            ))
+            payments = resp.payments
+            for p in payments:
+                db_payment = Payments.objects.filter(payment_hash=p.payment_hash)
+                db_payment.index = p.payment_index
+                db_payment.save()
+            if len(payments) < page_size:
+                break
+
+    # Update inflight payments
     self_pubkey = _get_self_pubkey(stub)
     inflight_payments = Payments.objects.filter(status=1).order_by('index')
     for payment in inflight_payments:
@@ -41,102 +64,50 @@ def update_payments(stub):
             payment.status = 3
             payment.save()
 
-    page_size = 1000
-    have_rows = Payments.objects.exists()
+    # Bulk payment sync
+    page_size = 300
+    index_offset = last_db_payment_index
+    while True:
+        resp = stub.ListPayments(ln.ListPaymentsRequest(
+            include_incomplete=True,
+            index_offset=index_offset,
+            max_payments=page_size
+        ))
+        payments = resp.payments
+        if not payments:
+            break
 
-    if not have_rows:
-        start_ts = int(datetime(2015, 1, 1).timestamp())
-        index_offset = 0
-        while True:
-            resp = stub.ListPayments(ln.ListPaymentsRequest(
-                include_incomplete=True,
-                creation_date_start=start_ts,
-                index_offset=index_offset,
-                max_payments=page_size
-            ))
-            payments = resp.payments
-            if not payments:
-                break
+        page_hashes = [p.payment_hash for p in payments]
+        existing_hashes = set(list(
+            Payments.objects.filter(payment_hash__in=page_hashes)
+            .only('payment_hash').values_list('payment_hash', flat=True)
+        ))
+        new_hashes = set(page_hashes) - existing_hashes
 
-            page_hashes = [p.payment_hash for p in payments]
-            existing_hashes = set(list(
-                Payments.objects.filter(payment_hash__in=page_hashes)
-                .only('payment_hash').values_list('payment_hash', flat=True)
-            ))
-            new_hashes = set(page_hashes) - existing_hashes
+        new_payments = []
+        for p in payments:
+            if p.payment_hash in new_hashes:
+                new_payments.append(Payments(
+                    creation_date=datetime.fromtimestamp(p.creation_date),
+                    payment_hash=p.payment_hash,
+                    value=round(p.value_msat/1000, 3),
+                    fee=round(p.fee_msat/1000, 3),
+                    status=p.status,
+                    index=p.payment_index
+                ))
+        if new_payments:
+            try:
+                Payments.objects.bulk_create(new_payments, ignore_conflicts=True, batch_size=page_size)
+            except Exception as e:
+                logger.error(f'Error bulk inserting payments: {str(e)}')
 
-            new_payments = []
-            for p in payments:
-                if p.payment_hash in new_hashes:
-                    new_payments.append(Payments(
-                        creation_date=datetime.fromtimestamp(p.creation_date),
-                        payment_hash=p.payment_hash,
-                        value=round(p.value_msat/1000, 3),
-                        fee=round(p.fee_msat/1000, 3),
-                        status=p.status,
-                        index=p.payment_index
-                    ))
-            if new_payments:
-                try:
-                    Payments.objects.bulk_create(new_payments, ignore_conflicts=True, batch_size=1000)
-                except Exception as e:
-                    logger.error(f'Error bulk inserting payments: {str(e)}')
+        for p in payments:
+            if (p.payment_hash in new_hashes) or (p.status in (0, 1)):
+                update_payment(stub, p, self_pubkey)
 
-            for p in payments:
-                if (p.payment_hash in new_hashes) or (p.status in (0, 1)):
-                    update_payment(stub, p, self_pubkey)
-
-            index_offset = resp.last_index_offset
-            if len(payments) < page_size:
-                break
-    else:
-        try:
-            latest_index = Payments.objects.latest('index').index
-        except Payments.DoesNotExist:
-            latest_index = 0
-
-        index_offset = latest_index
-        while True:
-            resp = stub.ListPayments(ln.ListPaymentsRequest(
-                include_incomplete=True,
-                index_offset=index_offset,
-                max_payments=page_size
-            ))
-            payments = resp.payments
-            if not payments:
-                break
-
-            page_hashes = [p.payment_hash for p in payments]
-            existing_hashes = set(list(
-                Payments.objects.filter(payment_hash__in=page_hashes)
-                .only('payment_hash').values_list('payment_hash', flat=True)
-            ))
-            new_hashes = set(page_hashes) - existing_hashes
-
-            new_payments = []
-            for p in payments:
-                if p.payment_hash in new_hashes:
-                    new_payments.append(Payments(
-                        creation_date=datetime.fromtimestamp(p.creation_date),
-                        payment_hash=p.payment_hash,
-                        value=round(p.value_msat/1000, 3),
-                        fee=round(p.fee_msat/1000, 3),
-                        status=p.status,
-                        index=p.payment_index
-                    ))
-            if new_payments:
-                try:
-                    Payments.objects.bulk_create(new_payments, ignore_conflicts=True, batch_size=1000)
-                except Exception as e:
-                    logger.error(f'Error bulk inserting payments: {str(e)}')
-
-            for p in payments:
-                if (p.payment_hash in new_hashes) or (p.status in (0, 1)):
-                    update_payment(stub, p, self_pubkey)
-
-            index_offset = resp.last_index_offset
-            if len(payments) < page_size:
-                break
+        index_offset = resp.last_index_offset
+        if len(payments) < page_size:
+            break
 
 def update_payment(stub, payment, self_pubkey):
     db_payment = Payments.objects.filter(payment_hash=payment.payment_hash)[0]
@@ -186,6 +157,28 @@ def update_payment(stub, payment, self_pubkey):
     db_payment.save()
 
 def update_invoices(stub):
+    # Detect if index out of sync and resync if required
+    last_invoice_index = stub.ListInvoices(ln.ListInvoiceRequest(reversed=True, num_max_invoices=1)).invoices[0].add_index
+    last_db_inv_index = Invoices.objects.aggregate(Max('index'))['index__max'] or 0
+    if last_invoice_index is not None and last_db_inv_index > last_invoice_index:
+        logger.warning(f'Invoice data index greater than LND index, invoice reindexing triggered')
+        Invoices.objects.all().update(index=0)
+        page_size = 300
+        index_offset = 0
+        while True:
+            resp = stub.ListInvoices(ln.ListInvoiceRequest(
+                index_offset=index_offset,
+                num_max_invoices=page_size
+            ))
+            invoices = resp.invoices
+            for i in invoices:
+                db_invoice = Invoices.objects.filter(r_hash=i.r_hash)
+                db_invoice.index = i.add_index
+                db_invoice.save()
+            if len(invoices) < page_size:
+                break
+
+    # Refresh all currently open invoices
     open_invoices = Invoices.objects.filter(state=0).order_by('index')
     for open_invoice in open_invoices:
         invoice_data = stub.ListInvoices(ln.ListInvoiceRequest(index_offset=open_invoice.index-1, num_max_invoices=1)).invoices
@@ -194,12 +187,46 @@ def update_invoices(stub):
         else:
             open_invoice.state = 2
             open_invoice.save()
-    last_index = Invoices.objects.aggregate(Max('index'))['index__max'] if Invoices.objects.exists() else 0
-    invoices = stub.ListInvoices(ln.ListInvoiceRequest(index_offset=last_index, num_max_invoices=100)).invoices
-    for invoice in invoices:
-        db_invoice = Invoices(creation_date=datetime.fromtimestamp(invoice.creation_date), r_hash=invoice.r_hash.hex(), value=round(invoice.value_msat/1000, 3), amt_paid=invoice.amt_paid_sat, state=invoice.state, index=invoice.add_index)
-        db_invoice.save()
-        update_invoice(stub, invoice, db_invoice)
+
+    # Bulk invoice sync
+    index_offset = last_db_inv_index
+    page_size = 300
+
+    while True:
+        resp = stub.ListInvoices(ln.ListInvoiceRequest(
+            index_offset=index_offset,
+            num_max_invoices=page_size
+        ))
+        if not resp.invoices:
+            break
+
+        new_batch = []
+        to_update = []
+        for inv in resp.invoices:
+            db_inv = Invoices(
+                creation_date=datetime.fromtimestamp(inv.creation_date),
+                r_hash=inv.r_hash.hex(),
+                value=round(inv.value_msat / 1000, 3),
+                amt_paid=inv.amt_paid_sat,
+                state=inv.state,
+                index=inv.add_index,
+            )
+            new_batch.append(db_inv)
+            if inv.state == 1:
+                to_update.append((inv, db_inv))
+
+        if new_batch:
+            try:
+                Invoices.objects.bulk_create(new_batch, batch_size=page_size, ignore_conflicts=True)
+            except Exception as e:
+                logger.error(f'Error bulk inserting invoices: {str(e)}')
+
+        for inv, db_inv in to_update:
+            update_invoice(stub, inv, db_inv)
+
+        index_offset = resp.last_index_offset
+        if len(resp.invoices) < page_size:
+            break
 
 def update_invoice(stub, invoice, db_invoice):
     if invoice.state == 1:
