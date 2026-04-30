@@ -46,7 +46,7 @@ def update_payments(stub):
             ))
             payments = resp.payments
             for p in payments:
-                db_payment = Payments.objects.filter(payment_hash=p.payment_hash)
+                db_payment = Payments.objects.get(payment_hash=p.payment_hash)
                 db_payment.index = p.payment_index
                 db_payment.save()
             if len(payments) < page_size:
@@ -110,7 +110,7 @@ def update_payments(stub):
             break
 
 def update_payment(stub, payment, self_pubkey):
-    db_payment = Payments.objects.filter(payment_hash=payment.payment_hash)[0]
+    db_payment = Payments.objects.get(payment_hash=payment.payment_hash)
     db_payment.creation_date = datetime.fromtimestamp(payment.creation_date)
     db_payment.value = round(payment.value_msat/1000, 3)
     db_payment.fee = round(payment.fee_msat/1000, 3)
@@ -172,7 +172,7 @@ def update_invoices(stub):
             ))
             invoices = resp.invoices
             for i in invoices:
-                db_invoice = Invoices.objects.filter(r_hash=i.r_hash)
+                db_invoice = Invoices.objects.get(r_hash=i.r_hash)
                 db_invoice.index = i.add_index
                 db_invoice.save()
             if len(invoices) < page_size:
