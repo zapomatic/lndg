@@ -49,6 +49,7 @@ def update_payments(stub):
                 db_payment = Payments.objects.get(payment_hash=p.payment_hash)
                 db_payment.index = p.payment_index
                 db_payment.save()
+            index_offset = resp.last_index_offset
             if len(payments) < page_size:
                 break
 
@@ -175,6 +176,7 @@ def update_invoices(stub):
                 db_invoice = Invoices.objects.get(r_hash=i.r_hash)
                 db_invoice.index = i.add_index
                 db_invoice.save()
+            index_offset = resp.last_index_offset
             if len(invoices) < page_size:
                 break
 
