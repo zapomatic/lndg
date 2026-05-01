@@ -162,29 +162,29 @@ def update_payment(stub, payment, self_pubkey):
 
 def update_invoices(stub):
     # Detect if index out of sync and resync if required
-    last_invoice_index = stub.ListInvoices(ln.ListInvoiceRequest(reversed=True, num_max_invoices=1)).invoices[0].add_index
-    last_db_inv_index = Invoices.objects.exclude(state=0).aggregate(Max('index'))['index__max'] or 0
-    if last_invoice_index is not None and last_db_inv_index > last_invoice_index:
-        logger.warning(f'Invoice data index greater than LND index, invoice reindexing triggered')
-        Invoices.objects.all().update(index=0)
-        page_size = 300
-        index_offset = 0
-        while True:
-            resp = stub.ListInvoices(ln.ListInvoiceRequest(
-                index_offset=index_offset,
-                num_max_invoices=page_size
-            ))
-            invoices = resp.invoices
-            for i in invoices:
-                try:
-                    db_invoice = Invoices.objects.get(r_hash=i.r_hash.hex())
-                    db_invoice.index = i.add_index
-                    db_invoice.save()
-                except Invoices.DoesNotExist:
-                    logger.warning(f'Invoice not found during reindex: {i.r_hash.hex()}')
-            index_offset = resp.last_index_offset
-            if len(invoices) < page_size:
-                break
+    # last_invoice_index = stub.ListInvoices(ln.ListInvoiceRequest(reversed=True, num_max_invoices=1)).invoices[0].add_index
+    # last_db_inv_index = Invoices.objects.exclude(state=0).aggregate(Max('index'))['index__max'] or 0
+    # if last_invoice_index is not None and last_db_inv_index > last_invoice_index:
+    #     logger.warning(f'Invoice data index greater than LND index, invoice reindexing triggered')
+    #     Invoices.objects.all().update(index=0)
+    #     page_size = 300
+    #     index_offset = 0
+    #     while True:
+    #         resp = stub.ListInvoices(ln.ListInvoiceRequest(
+    #             index_offset=index_offset,
+    #             num_max_invoices=page_size
+    #         ))
+    #         invoices = resp.invoices
+    #         for i in invoices:
+    #             try:
+    #                 db_invoice = Invoices.objects.get(r_hash=i.r_hash.hex())
+    #                 db_invoice.index = i.add_index
+    #                 db_invoice.save()
+    #             except Invoices.DoesNotExist:
+    #                 logger.warning(f'Invoice not found during reindex: {i.r_hash.hex()}')
+    #         index_offset = resp.last_index_offset
+    #         if len(invoices) < page_size:
+    #             break
 
     # Refresh all currently open invoices
     open_invoices = Invoices.objects.filter(state=0).order_by('index')
