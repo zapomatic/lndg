@@ -46,9 +46,12 @@ def update_payments(stub):
             ))
             payments = resp.payments
             for p in payments:
-                db_payment = Payments.objects.get(payment_hash=p.payment_hash)
-                db_payment.index = p.payment_index
-                db_payment.save()
+                try:
+                    db_payment = Payments.objects.get(payment_hash=p.payment_hash)
+                    db_payment.index = p.payment_index
+                    db_payment.save()
+                except Payments.DoesNotExist:
+                    logger.warning(f'Payment not found during reindex: {p.payment_hash}')
             index_offset = resp.last_index_offset
             if len(payments) < page_size:
                 break
@@ -173,9 +176,12 @@ def update_invoices(stub):
             ))
             invoices = resp.invoices
             for i in invoices:
-                db_invoice = Invoices.objects.get(r_hash=i.r_hash)
-                db_invoice.index = i.add_index
-                db_invoice.save()
+                try:
+                    db_invoice = Invoices.objects.get(r_hash=i.r_hash)
+                    db_invoice.index = i.add_index
+                    db_invoice.save()
+                except Invoices.DoesNotExist:
+                    logger.warning(f'Invoice not found during reindex: {i.r_hash}')
             index_offset = resp.last_index_offset
             if len(invoices) < page_size:
                 break
