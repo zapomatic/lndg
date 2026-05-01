@@ -177,11 +177,11 @@ def update_invoices(stub):
             invoices = resp.invoices
             for i in invoices:
                 try:
-                    db_invoice = Invoices.objects.get(r_hash=i.r_hash)
+                    db_invoice = Invoices.objects.get(r_hash=i.r_hash.hex())
                     db_invoice.index = i.add_index
                     db_invoice.save()
                 except Invoices.DoesNotExist:
-                    logger.warning(f'Invoice not found during reindex: {i.r_hash}')
+                    logger.warning(f'Invoice not found during reindex: {i.r_hash.hex()}')
             index_offset = resp.last_index_offset
             if len(invoices) < page_size:
                 break
