@@ -197,6 +197,7 @@ def update_invoices(stub):
             open_invoice.save()
 
     # Bulk invoice sync
+    last_db_inv_index = Invoices.objects.aggregate(Max('index'))['index__max'] or 0
     index_offset = last_db_inv_index
     page_size = 300
 
