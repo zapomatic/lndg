@@ -1,4 +1,4 @@
-import os, stat, secrets, argparse, django
+import os, secrets, argparse, django
 from pathlib import Path
 from django.core.management import call_command
 from django.contrib.auth import get_user_model
@@ -340,10 +340,10 @@ def initialize_django(adminuser, adminpw):
                 if adminpw is None:
                     try:
                         Path(os.path.join(DATA_DIR, 'lndg-admin.txt')).touch(mode=0o600)
+                        Path(os.path.join(DATA_DIR, 'lndg-admin.txt')).chmod(0o600)
                         f = open('data/lndg-admin.txt', 'w')
                         f.write(login_pw)
                         f.close()
-                        os.chmod('data/lndg-admin.txt', stat.S_IRUSR | stat.S_IWUSR)
                     except Exception as e:
                         print('Error writing password file:', str(e))
                     print('FIRST TIME LOGIN PASSWORD:' + login_pw)
