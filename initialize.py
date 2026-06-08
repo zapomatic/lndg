@@ -395,7 +395,6 @@ def main():
     lnd_database_path = args.lnddatabase if args.lnddatabase else lnd_dir_path + '/data/graph/' + lnd_network + '/channel.db'
     cookie_age = int(args.sessioncookieage)
     if docker:
-        setup_supervisord = True
         whitenoise = True
     write_settings(node_ip, lnd_tls_path, lnd_macaroon_path, lnd_database_path, lnd_network, lnd_rpc_server, lnd_max_message, whitenoise, debug, csrftrusted, nologinrequired, force_new, cookie_age)
     if setup_supervisord:
