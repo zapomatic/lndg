@@ -46,8 +46,8 @@ def main():
             except Exception as db_err:
                 logger.error(f"Error closing database connections: {str(db_err)}")
         finally:
+            logger.info('Removing any remaining processes...')
             if 'p2p_thread' in locals() and p2p_thread.is_alive():
-                logger.info('Removing any remaining processes...')
                 p2p_thread.terminate()       
             sleep(20)
 

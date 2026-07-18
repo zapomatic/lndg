@@ -839,8 +839,9 @@ def main():
                 connections.close_all()
             except Exception as db_err:
                 logger.error(f"Error closing database connections: {str(db_err)}")
-        logger.info('Data execution completed...sleeping for 20 seconds')
-        sleep(20)
+        finally:
+            logger.info('Data execution completed...sleeping for 20 seconds')
+            sleep(20)
 
 if __name__ == '__main__':
     main()

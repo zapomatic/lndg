@@ -445,8 +445,7 @@ def main():
             logger.info('Rebalancer successfully exited...sleeping for 20 seconds')
             sleep(20)
     except Exception as e:
-        error = str(e)
-        logger.error(f'Rebalancer loop error: {error}')
+        logger.error(f'Rebalancer loop error: {str(e)}')
         close_db_connections()
     finally:
         logger.info('Rebalancer loop has been terminated')

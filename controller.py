@@ -72,6 +72,10 @@ def main():
 
             time.sleep(2)
     except KeyboardInterrupt:
+        logger.info('Keyboard interrupt received...')
+    except Exception as e:
+        logger.error(f'Controller exited for error: {str(e)}')
+    finally:
         logger.info('Controller is stopping...')
         for name, info in running_tasks.items():
             if info['process'].is_alive():

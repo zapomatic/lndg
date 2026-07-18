@@ -66,6 +66,8 @@ def main():
                 connections.close_all()
             except Exception as db_err:
                 logger.error(f"Error closing database connections: {str(db_err)}")
+        finally:
+            logger.info('HTLC Stream has shutdown')
             sleep(20)
 
 if __name__ == '__main__':
