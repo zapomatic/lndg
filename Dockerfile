@@ -4,4 +4,4 @@ RUN apk add git g++ linux-headers && git clone https://github.com/cryptosharks13
 WORKDIR /app
 RUN git checkout "master"
 RUN pip install -r requirements.txt
-RUN pip install supervisor whitenoise
+RUN pip install whitenoise

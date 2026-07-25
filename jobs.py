@@ -1,4 +1,5 @@
 import django
+import random
 from time import sleep
 from django.db.models import Max, Sum, Avg, Count
 from django.db.models.functions import TruncDay
@@ -15,31 +16,106 @@ environ['DJANGO_SETTINGS_MODULE'] = 'lndg.settings'
 django.setup()
 from gui.models import Payments, PaymentHops, Invoices, Forwards, Channels, Peers, Onchain, Closures, Resolutions, PendingHTLCs, LocalSettings, FailedHTLCs, Autofees, InboundFeeLog, PendingChannels, HistFailedHTLC, PeerEvents
 import af
+import logging
+logger = logging.getLogger('[Data]')
+_SELF_PUBKEY = None
+
+def _get_self_pubkey(stub):
+    global _SELF_PUBKEY
+    if _SELF_PUBKEY is None:
+        try:
+            _SELF_PUBKEY = stub.GetInfo(ln.GetInfoRequest()).identity_pubkey
+        except Exception as e:
+            logger.critical(f'GetInfo failed to get self pubkey: {e}')
+            raise
+    return _SELF_PUBKEY
 
 def update_payments(stub):
-    self_pubkey = stub.GetInfo(ln.GetInfoRequest()).identity_pubkey
+    # Detect if index out of sync and resync if required
+    last_payment_index = stub.ListPayments(ln.ListPaymentsRequest(include_incomplete=True, reversed=True, max_payments=1)).last_index_offset
+    last_db_payment_index = Payments.objects.aggregate(Max('index'))['index__max'] or 0
+    if last_payment_index != 0 and last_db_payment_index > last_payment_index:
+        logger.warning(f'Payment data index greater than LND index, payment reindexing triggered')
+        Payments.objects.all().update(index=0)
+        page_size = 300
+        index_offset = 0
+        while True:
+            resp = stub.ListPayments(ln.ListPaymentsRequest(
+                include_incomplete=True,
+                index_offset=index_offset,
+                max_payments=page_size
+            ))
+            payments = resp.payments
+            for p in payments:
+                try:
+                    db_payment = Payments.objects.get(payment_hash=p.payment_hash)
+                    db_payment.index = p.payment_index
+                    db_payment.save()
+                except Payments.DoesNotExist:
+                    logger.warning(f'Payment not found during reindex: {p.payment_hash}')
+            index_offset = resp.last_index_offset
+            if len(payments) < page_size:
+                break
+
+    # Update inflight payments
+    self_pubkey = _get_self_pubkey(stub)
     inflight_payments = Payments.objects.filter(status=1).order_by('index')
     for payment in inflight_payments:
         payment_data = stub.ListPayments(ln.ListPaymentsRequest(include_incomplete=True, index_offset=payment.index-1, max_payments=1)).payments
-        #Ignore inflight payments before 30 days
+        # Ignore inflight payments before 30 days
         if len(payment_data) > 0 and payment.payment_hash == payment_data[0].payment_hash and payment.creation_date > (datetime.now() - timedelta(days=30)):
             update_payment(stub, payment_data[0], self_pubkey)
         else:
             payment.status = 3
             payment.save()
-    last_index = Payments.objects.aggregate(Max('index'))['index__max'] if Payments.objects.exists() else 0
-    payments = stub.ListPayments(ln.ListPaymentsRequest(include_incomplete=True, index_offset=last_index, max_payments=100)).payments
-    for payment in payments:
-        try:
-            new_payment = Payments(creation_date=datetime.fromtimestamp(payment.creation_date), payment_hash=payment.payment_hash, value=round(payment.value_msat/1000, 3), fee=round(payment.fee_msat/1000, 3), status=payment.status, index=payment.payment_index)
-            new_payment.save()
-        except Exception as e:
-            #Error inserting, try to update instead
-            print(f"{datetime.now().strftime('%c')} : [Data] : Error processing {new_payment}: {str(e)}")
-        update_payment(stub, payment, self_pubkey)
+
+    # Bulk payment sync
+    page_size = 300
+    index_offset = last_db_payment_index
+    while True:
+        resp = stub.ListPayments(ln.ListPaymentsRequest(
+            include_incomplete=True,
+            index_offset=index_offset,
+            max_payments=page_size
+        ))
+        payments = resp.payments
+        if not payments:
+            break
+
+        page_hashes = [p.payment_hash for p in payments]
+        existing_hashes = set(list(
+            Payments.objects.filter(payment_hash__in=page_hashes)
+            .only('payment_hash').values_list('payment_hash', flat=True)
+        ))
+        new_hashes = set(page_hashes) - existing_hashes
+
+        new_payments = []
+        for p in payments:
+            if p.payment_hash in new_hashes:
+                new_payments.append(Payments(
+                    creation_date=datetime.fromtimestamp(p.creation_date),
+                    payment_hash=p.payment_hash,
+                    value=round(p.value_msat/1000, 3),
+                    fee=round(p.fee_msat/1000, 3),
+                    status=p.status,
+                    index=p.payment_index
+                ))
+        if new_payments:
+            try:
+                Payments.objects.bulk_create(new_payments, ignore_conflicts=True, batch_size=page_size)
+            except Exception as e:
+                logger.error(f'Error bulk inserting payments: {str(e)}')
+
+        for p in payments:
+            if (p.payment_hash in new_hashes) or (p.status in (0, 1)):
+                update_payment(stub, p, self_pubkey)
+
+        index_offset = resp.last_index_offset
+        if len(payments) < page_size:
+            break
 
 def update_payment(stub, payment, self_pubkey):
-    db_payment = Payments.objects.filter(payment_hash=payment.payment_hash)[0]
+    db_payment = Payments.objects.get(payment_hash=payment.payment_hash)
     db_payment.creation_date = datetime.fromtimestamp(payment.creation_date)
     db_payment.value = round(payment.value_msat/1000, 3)
     db_payment.fee = round(payment.fee_msat/1000, 3)
@@ -86,6 +162,33 @@ def update_payment(stub, payment, self_pubkey):
     db_payment.save()
 
 def update_invoices(stub):
+    # Detect if index out of sync and resync if required
+    last_invoice_index = stub.ListInvoices(ln.ListInvoiceRequest(reversed=True, num_max_invoices=1)).last_index_offset
+    last_db_inv_index = Invoices.objects.filter(state=1).aggregate(Max('index'))['index__max'] or 0
+    if last_invoice_index != 0 and last_db_inv_index > last_invoice_index:
+        logger.warning(f'Invoice data index greater than LND index, invoice reindexing triggered')
+        Invoices.objects.all().update(index=0)
+        page_size = 300
+        index_offset = 0
+        while True:
+            resp = stub.ListInvoices(ln.ListInvoiceRequest(
+                index_offset=index_offset,
+                num_max_invoices=page_size
+            ))
+            invoices = resp.invoices
+            for i in invoices:
+                try:
+                    db_invoice = Invoices.objects.get(r_hash=i.r_hash.hex())
+                    db_invoice.index = i.add_index
+                    db_invoice.save()
+                except Invoices.DoesNotExist:
+                    logger.warning(f'Invoice not found during reindex: {i.r_hash.hex()}')
+            index_offset = resp.last_index_offset
+            if len(invoices) < page_size:
+                break
+        Invoices.objects.filter(state=0, index=0).update(state=2)
+
+    # Refresh all currently open invoices
     open_invoices = Invoices.objects.filter(state=0).order_by('index')
     for open_invoice in open_invoices:
         invoice_data = stub.ListInvoices(ln.ListInvoiceRequest(index_offset=open_invoice.index-1, num_max_invoices=1)).invoices
@@ -94,12 +197,46 @@ def update_invoices(stub):
         else:
             open_invoice.state = 2
             open_invoice.save()
-    last_index = Invoices.objects.aggregate(Max('index'))['index__max'] if Invoices.objects.exists() else 0
-    invoices = stub.ListInvoices(ln.ListInvoiceRequest(index_offset=last_index, num_max_invoices=100)).invoices
-    for invoice in invoices:
-        db_invoice = Invoices(creation_date=datetime.fromtimestamp(invoice.creation_date), r_hash=invoice.r_hash.hex(), value=round(invoice.value_msat/1000, 3), amt_paid=invoice.amt_paid_sat, state=invoice.state, index=invoice.add_index)
-        db_invoice.save()
-        update_invoice(stub, invoice, db_invoice)
+
+    # Bulk invoice sync
+    index_offset = Invoices.objects.aggregate(Max('index'))['index__max'] or 0
+    page_size = 300
+
+    while True:
+        resp = stub.ListInvoices(ln.ListInvoiceRequest(
+            index_offset=index_offset,
+            num_max_invoices=page_size
+        ))
+        if not resp.invoices:
+            break
+
+        new_batch = []
+        to_update = []
+        for inv in resp.invoices:
+            db_inv = Invoices(
+                creation_date=datetime.fromtimestamp(inv.creation_date),
+                r_hash=inv.r_hash.hex(),
+                value=round(inv.value_msat / 1000, 3),
+                amt_paid=inv.amt_paid_sat,
+                state=inv.state,
+                index=inv.add_index,
+            )
+            new_batch.append(db_inv)
+            if inv.state == 1:
+                to_update.append((inv, db_inv))
+
+        if new_batch:
+            try:
+                Invoices.objects.bulk_create(new_batch, batch_size=page_size, ignore_conflicts=True)
+            except Exception as e:
+                logger.error(f'Error bulk inserting invoices: {str(e)}')
+
+        for inv, db_inv in to_update:
+            update_invoice(stub, inv, db_inv)
+
+        index_offset = resp.last_index_offset
+        if len(resp.invoices) < page_size:
+            break
 
 def update_invoice(stub, invoice, db_invoice):
     if invoice.state == 1:
@@ -111,11 +248,11 @@ def update_invoice(stub, invoice, db_invoice):
             message = records[34349334].decode('utf-8', errors='ignore')[:1000] if 34349334 in records else None
             if 34349337 in records and 34349339 in records and 34349343 in records and 34349334 in records:
                 signerstub = lnsigner.SignerStub(lnd_connect())
-                self_pubkey = stub.GetInfo(ln.GetInfoRequest()).identity_pubkey
+                self_pubkey = _get_self_pubkey(stub)
                 try:
                     valid = signerstub.VerifyMessage(lns.VerifyMessageReq(msg=(records[34349339]+bytes.fromhex(self_pubkey)+records[34349343]+records[34349334]), signature=records[34349337], pubkey=records[34349339])).valid
                 except:
-                    print(f"{datetime.now().strftime('%c')} : [Data] : Unable to validate signature on invoice: {invoice.r_hash.hex()}")
+                    logger.error(f'Unable to validate signature on invoice: {invoice.r_hash.hex()}')
                     valid = False
                 sender = records[34349339].hex() if valid == True else None
                 try:
@@ -187,11 +324,11 @@ def update_forwards(stub):
 def disconnectpeer(stub, peer):
     try:
         stub.DisconnectPeer(ln.DisconnectPeerRequest(pub_key=peer.pubkey))
-        print(f"{datetime.now().strftime('%c')} : [Data] : Disconnected peer {peer.alias} {peer.pubkey}")
+        logger.info(f'Disconnected peer {peer.alias} {peer.pubkey}')
         peer.connected = False
         peer.save()
     except Exception as e:
-        print(f"{datetime.now().strftime('%c')} : [Data] : Error disconnecting peer {peer.alias} {peer.pubkey}: {str(e)}")
+        logger.error(f'Error disconnecting peer {peer.alias} {peer.pubkey}: {str(e)}')
 
 def update_channels(stub):
     counter = 0
@@ -203,11 +340,11 @@ def update_channels(stub):
     version = get_info.version
     for channel in channels:
         if Channels.objects.filter(chan_id=channel.chan_id).exists():
-            #Update the channel record with the most current data
+            # Update the channel record with the most current data
             db_channel = Channels.objects.filter(chan_id=channel.chan_id)[0]
             pending_channel = None
         else:
-            #Create a record for this new channel
+            # Create a record for this new channel
             try:
                 alias = stub.GetNodeInfo(ln.NodeInfoRequest(pub_key=channel.remote_pubkey, include_channels=False)).node.alias
             except:
@@ -260,12 +397,12 @@ def update_channels(stub):
                 if htlc.expiration_height - block_height <= 13: # If htlc is expiring within 13 blocks, disconnect peer to help resolve the stuck htlc
                     peer = Peers.objects.filter(pubkey=channel.remote_pubkey)[0] if Peers.objects.filter(pubkey=channel.remote_pubkey).exists() else None
                     if peer and (not peer.last_reconnected or (int((datetime.now() - peer.last_reconnected).total_seconds() / 60) > 10)):
-                        print(f"{datetime.now().strftime('%c')} : [Data] : HTLC expiring at {htlc.expiration_height} and within 13 blocks of {block_height}, disconnecting peer {channel.remote_pubkey} to resolve HTLC: {htlc.hash_lock.hex()} ")
+                        logger.info(f'HTLC expiring at {htlc.expiration_height} and within 13 blocks of {block_height}, disconnecting peer {channel.remote_pubkey} to resolve HTLC: {htlc.hash_lock.hex()}')
                         disconnectpeer(stub, peer)
                         peer.last_reconnected = datetime.now()
                         peer.save()
                     else:
-                        print(f"{datetime.now().strftime('%c')} : [Data] : Could not find peer {channel.remote_pubkey} with expiring HTLC: {htlc.hash_lock.hex()}")
+                        logger.error(f'Could not find peer {channel.remote_pubkey} with expiring HTLC: {htlc.hash_lock.hex()}')
         db_channel.pending_outbound = pending_out
         db_channel.pending_inbound = pending_in
         db_channel.htlc_count = htlc_counter
@@ -375,9 +512,9 @@ def update_channels(stub):
                     db_channel.remote_inbound_base_fee = 0
                     db_channel.remote_inbound_fee_rate = 0
         except Exception as e: # LND has not found the channel on the graph
-            print(f"{datetime.now().strftime('%c')} : [Data] : Error getting graph data for channel {db_channel.chan_id}: {str(e)}")
+            logger.error(f'Error getting graph data for channel {db_channel.chan_id}: {str(e)}')
             if pending_channel: # skip adding new channel to the list, LND may not have added to the graph yet
-                print(f"{datetime.now().strftime('%c')} : [Data] : Waiting for pending channel {db_channel.chan_id} to be added to the graph...")
+                logger.error(f'Waiting for pending channel {db_channel.chan_id} to be added to the graph...')
                 continue
             else:
                 old_fee_rate = None
@@ -426,16 +563,16 @@ def update_channels(stub):
                 db_channel.auto_fees = pending_channel.auto_fees
             pending_channel.delete()
         if old_fee_rate is not None and old_fee_rate != local_policy.fee_rate_milli_msat:
-            print(f"{datetime.now().strftime('%c')} : [Data] : Ext fee change detected on {db_channel.chan_id} for peer {db_channel.alias}: fee updated from {old_fee_rate} to {db_channel.local_fee_rate}")
-            #External Fee change detected, update auto fee log
+            logger.info(f'Ext fee change detected on {db_channel.chan_id} for peer {db_channel.alias}: fee updated from {old_fee_rate} to {db_channel.local_fee_rate}')
+            # External Fee change detected, update auto fee log
             db_channel.fees_updated = datetime.now()
-            Autofees(chan_id=db_channel.chan_id, peer_alias=db_channel.alias, setting=(f"Ext"), old_value=old_fee_rate, new_value=db_channel.local_fee_rate).save()
+            Autofees(chan_id=db_channel.chan_id, peer_alias=db_channel.alias, setting=('Ext'), old_value=old_fee_rate, new_value=db_channel.local_fee_rate).save()
         db_channel.save()
         counter += 1
         chan_list.append(channel.chan_id)
     records = Channels.objects.filter(is_open=True).count()
     if records > counter:
-        #A channel must have been closed, mark it as closed
+        # A channel must have been closed, mark it as closed
         channels = Channels.objects.filter(is_open=True).exclude(chan_id__in=chan_list)
         for channel in channels:
             channel.last_update = datetime.now()
@@ -500,7 +637,7 @@ def get_tx_fees(txid):
         request_data = get(base_url + txid).json()
         fee = request_data['fee']
     except Exception as e:
-        print(f"{datetime.now().strftime('%c')} : [Data] : Error getting closure fees for {txid}: {str(e)}")
+        logger.error(f'Error getting closure fees for {txid}: {str(e)}')
         fee = 0
     return fee
 
@@ -519,7 +656,7 @@ def update_closures(stub):
                 try:
                     db_closure.save()
                 except Exception as e:
-                    print(f"{datetime.now().strftime('%c')} : [Data] : Error inserting closure: {str(e)}")
+                    logger.error(f'Error inserting closure: {str(e)}')
                     Closures.objects.filter(funding_txid=txid,funding_index=index).delete()
                     return
                 if resolution_count > 0:
@@ -532,26 +669,31 @@ def update_closures(stub):
                 db_closure.save()
 
 def reconnect_peers(stub):
+    if LocalSettings.objects.filter(key='LND-ReconnectInterval').exists():
+        reconnect_interval = int(LocalSettings.objects.filter(key='LND-ReconnectInterval')[0].value)
+    else:
+        LocalSettings(key='LND-ReconnectInterval', value='3').save()
+        reconnect_interval = 3
     inactive_peers = Channels.objects.filter(is_open=True, is_active=False, private=False).values_list('remote_pubkey', flat=True).distinct()
     if len(inactive_peers) > 0:
         peers = Peers.objects.all()
         for inactive_peer in inactive_peers:
             if peers.filter(pubkey=inactive_peer).exists():
                 peer = peers.filter(pubkey=inactive_peer)[0]
-                if peer.last_reconnected == None or (int((datetime.now() - peer.last_reconnected).total_seconds() / 60) > 2):
-                    print(f"{datetime.now().strftime('%c')} : [Data] : Reconnecting peer {peer.alias} {peer.pubkey}, last reconnected at {peer.last_reconnected}")
+                if peer.last_reconnected is None or ((datetime.now() - peer.last_reconnected).total_seconds() >= (reconnect_interval + random.uniform(0, reconnect_interval)) * 60):
+                    logger.info(f'Reconnecting peer {peer.alias} {peer.pubkey}, last reconnected at {peer.last_reconnected}')
                     if peer.connected == True:
-                        print(f"{datetime.now().strftime('%c')} : [Data] : Inactive channel is still connected to peer, disconnecting peer {peer.alias} {inactive_peer}")
+                        logger.info(f'Inactive channel is still connected to peer, disconnecting peer {peer.alias} {inactive_peer}')
                         disconnectpeer(stub, peer)
                     try:
                         node = stub.GetNodeInfo(ln.NodeInfoRequest(pub_key=inactive_peer, include_channels=False)).node
                         host = node.addresses[0].addr
                     except Exception as e:
-                        print(f"{datetime.now().strftime('%c')} : [Data] : Unable to find node info on graph, using last known value for {peer.alias} {peer.pubkey} at {peer.address}: {str(e)}")
+                        logger.error(f'Unable to find node info on graph, using last known value for {peer.alias} {peer.pubkey} at {peer.address}: {str(e)}')
                         host = peer.address
-                    print(f"{datetime.now().strftime('%c')} : [Data] : Attempting connection to {peer.alias} {inactive_peer} at {host}")
+                    logger.info(f'Attempting connection to {peer.alias} {inactive_peer} at {host}')
                     try:
-                        #try both the graph value and last know value
+                        # try both the graph value and last know value
                         stub.ConnectPeer(request = ln.ConnectPeerRequest(addr=ln.LightningAddress(pubkey=inactive_peer, host=host), perm=True, timeout=5))
                         if host != peer.address and peer.address[:9] != '127.0.0.1':
                             stub.ConnectPeer(request = ln.ConnectPeerRequest(addr=ln.LightningAddress(pubkey=inactive_peer, host=peer.address), perm=True, timeout=5))
@@ -560,7 +702,7 @@ def reconnect_peers(stub):
                         details_index = error.find('details =') + 11
                         debug_error_index = error.find('debug_error_string =') - 3
                         error_msg = error[details_index:debug_error_index]
-                        print(f"{datetime.now().strftime('%c')} : [Data] : Error reconnecting {peer.alias} {inactive_peer}: {error_msg}")
+                        logger.error(f'Error reconnecting {peer.alias} {inactive_peer}: {error_msg}')
                     peer.last_reconnected = datetime.now()
                     peer.save()
 
@@ -588,7 +730,7 @@ def clean_payments(stub):
                 details_index = error.find('details =') + 11
                 debug_error_index = error.find('debug_error_string =') - 3
                 error_msg = error[details_index:debug_error_index]
-                print(f"{datetime.now().strftime('%c')} : [Data] : Error cleaning payment {payment.payment_hash} at index {payment.index} with payment status {payment.status}: {error_msg}")
+                logger.error(f'Error cleaning payment {payment.payment_hash} at index {payment.index} with payment status {payment.status}: {error_msg}')
             finally:
                 payment.cleaned = True
                 payment.save()
@@ -628,19 +770,19 @@ def auto_fees(stub):
                             inbound_base_fee = -channel.local_base_fee
                         stub.UpdateChannelPolicy(ln.PolicyUpdateRequest(chan_point=channel_point, base_fee_msat=channel.local_base_fee, fee_rate=(target_channel['new_rate']/1000000), time_lock_delta=channel.local_cltv, inbound_fee=ln.InboundFee(base_fee_msat=inbound_base_fee, fee_rate_ppm=inbound_fee_rate)))
                         if target_channel['inbound_adjustment'] != 0:
-                            print(f"{datetime.now().strftime('%c')} : [Data] : Updating inbound fees for channel {str(target_channel['chan_id'])} to a value of: {str(target_channel['new_inbound_rate'])}")
+                            logger.info(f'Updating inbound fees for channel {str(target_channel["chan_id"])} to a value of: {str(target_channel["new_inbound_rate"])}')
                             channel.local_inbound_fee_rate = target_channel['new_inbound_rate']
                             InboundFeeLog(chan_id=channel.chan_id, peer_alias=channel.alias, setting=(f"AF [ {target_channel['net_routed_7day']}:{target_channel['in_percent']}:{target_channel['out_percent']} ]"), old_value=target_channel['local_inbound_fee_rate'], new_value=target_channel['new_inbound_rate']).save()
                     else:
                         stub.UpdateChannelPolicy(ln.PolicyUpdateRequest(chan_point=channel_point, base_fee_msat=channel.local_base_fee, fee_rate=(target_channel['new_rate']/1000000), time_lock_delta=channel.local_cltv))
                     if target_channel['adjustment'] != 0:
-                        print(f"{datetime.now().strftime('%c')} : [Data] : Updating outbound fees for channel {str(target_channel['chan_id'])} to a value of: {str(target_channel['new_rate'])}")
+                        logger.info(f'Updating outbound fees for channel {str(target_channel["chan_id"])} to a value of: {str(target_channel["new_rate"])}')
                         channel.local_fee_rate = target_channel['new_rate']
                         Autofees(chan_id=channel.chan_id, peer_alias=channel.alias, setting=(f"AF [ {target_channel['net_routed_7day']}:{target_channel['in_percent']}:{target_channel['out_percent']} ]"), old_value=target_channel['local_fee_rate'], new_value=target_channel['new_rate']).save()
                     channel.fees_updated = datetime.now()
                     channel.save()
     except Exception as e:
-        print(f"{datetime.now().strftime('%c')} : [Data] : Error processing auto_fees: {str(e)}")
+        logger.error(f'Error processing auto_fees: {str(e)}')
 
 
 def agg_htlcs(target_htlcs, category):
@@ -671,7 +813,7 @@ def agg_htlcs(target_htlcs, category):
             htlc_itm.save()
             FailedHTLCs.objects.filter(id__in=target_ids, chan_id_in=htlc['chan_id_in'], chan_id_out=htlc['chan_id_out']).annotate(day=TruncDay('timestamp')).filter(day=htlc['day']).delete()
     except Exception as e:
-        print(f"{datetime.now().strftime('%c')} : [Data] : Error processing agg_htlcs: {str(e)}")
+        logger.error(f'Error processing agg_htlcs: {str(e)}')
 
 def agg_failed_htlcs():
     time_filter = datetime.now() - timedelta(days=30)
@@ -681,10 +823,10 @@ def agg_failed_htlcs():
 
 def main():
     while True:
-        print(f"{datetime.now().strftime('%c')} : [Data] : Starting data execution...")
+        logger.info('Starting data execution...')
         try:
             stub = lnrpc.LightningStub(lnd_connect())
-            #Update data
+            # Update data
             update_peers(stub)
             update_channels(stub)
             update_invoices(stub)
@@ -697,9 +839,15 @@ def main():
             auto_fees(stub)
             agg_failed_htlcs()
         except Exception as e:
-            print(f"{datetime.now().strftime('%c')} : [Data] : Error processing background data: {str(e)}")
-        print(f"{datetime.now().strftime('%c')} : [Data] : Data execution completed...sleeping for 20 seconds")
-        sleep(20)
+            logger.error(f'Error processing background data: {str(e)}')
+            try:
+                from django.db import connections
+                connections.close_all()
+            except Exception as db_err:
+                logger.error(f"Error closing database connections: {str(db_err)}")
+        finally:
+            logger.info('Data execution completed...sleeping for 20 seconds')
+            sleep(20)
 
 if __name__ == '__main__':
     main()

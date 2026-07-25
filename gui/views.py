@@ -2,6 +2,7 @@ from django.contrib import messages
 from django.shortcuts import get_object_or_404, render, redirect
 from django.db.models import Sum, IntegerField, Count, Max, F, Q, Case, When, Value, FloatField, ExpressionWrapper, DateTimeField, DurationField
 from django.db.models.functions import Round, TruncDay, Coalesce
+from django.utils import timezone
 from django.contrib.auth.decorators import login_required
 from django_filters import FilterSet, CharFilter, DateTimeFilter, NumberFilter
 from datetime import datetime, timedelta
@@ -28,6 +29,8 @@ from requests import get
 from secrets import token_bytes
 from trade import create_trade_details
 import af
+import logging
+logger = logging.getLogger('django.lndg')
 
 def graph_links():
     if LocalSettings.objects.filter(key='GUI-GraphLinks').exists():
@@ -232,7 +235,7 @@ def logs(request):
         try:
             count = request.GET.get('tail', 20)
             grep = request.GET.get('grep', None)
-            logfile = '/var/log/lndg-controller.log'
+            logfile = path.join(settings.BASE_DIR, 'data/lndg-controller.log')
             file_size = path.getsize(logfile)-2
             if file_size == 0:
                 logs = ['Logs are empty....']
@@ -408,12 +411,10 @@ def closures(request):
         return redirect('home')
 
 def find_next_block_maturity(force_closing_channel):
-    #print (f"{datetime.now().strftime('%c')} : {force_closing_channel=}")
     if force_closing_channel.blocks_til_maturity > 0:
         return force_closing_channel.blocks_til_maturity
     for pending_htlc in force_closing_channel.pending_htlcs:
         if pending_htlc.blocks_til_maturity > 0:
-            #print (f"{datetime.now().strftime('%c')} : {pending_htlc=}")
             return pending_htlc.blocks_til_maturity
     return -1
 
@@ -996,9 +997,9 @@ def channel(request):
             channels_df['profits_vol_7day'] = 0 if channels_df['amt_routed_out_7day'].iloc[0] == 0 else (channels_df['profits_7day']/(channels_df['amt_routed_out_7day']/1000000)).astype(int)
             channels_df['profits_vol_1day'] = 0 if channels_df['amt_routed_out_1day'].iloc[0] == 0 else (channels_df['profits_1day']/(channels_df['amt_routed_out_1day']/1000000)).astype(int)
             channels_df = channels_df.copy()
-            channels_df['out_rate'] = int((channels_df['revenue_7day_fees']/channels_df['amt_routed_out_7day_fees'])*1000000) if channels_df['amt_routed_out_7day_fees'][0] > 0 else 0
-            channels_df['rebal_ppm'] = int((channels_df['costs_7day']/channels_df['amt_rebal_in_7day'])*1000000) if channels_df['amt_rebal_in_7day'][0] > 0 else 0
-            channels_df['assisted_ratio'] = round((channels_df['revenue_assist_7day_fees'] if channels_df['revenue_7day_fees'][0] == 0 else channels_df['revenue_assist_7day_fees']/channels_df['revenue_7day_fees']), 2)
+            channels_df['out_rate'] = int(((channels_df['revenue_7day_fees']/channels_df['amt_routed_out_7day_fees'])*1000000).iloc[0]) if channels_df['amt_routed_out_7day_fees'].iloc[0] > 0 else 0
+            channels_df['rebal_ppm'] = int(((channels_df['costs_7day']/channels_df['amt_rebal_in_7day'])*1000000).iloc[0]) if channels_df['amt_rebal_in_7day'].iloc[0] > 0 else 0
+            channels_df['assisted_ratio'] = round((channels_df['revenue_assist_7day_fees'] if channels_df['revenue_7day_fees'].iloc[0] == 0 else channels_df['revenue_assist_7day_fees']/channels_df['revenue_7day_fees']), 2)
             channels_df['inbound_can'] = ((channels_df['remote_balance']*100)/channels_df['capacity'])/channels_df['ar_in_target']
             channels_df['fee_ratio'] = 100 if channels_df['local_fee_rate'].iloc[0] == 0 else (round((channels_df['remote_fee_rate']/channels_df['local_fee_rate'])*1000/10)).astype(int)
             channels_df['fee_check'] = 1 if channels_df['ar_max_cost'].iloc[0] == 0 else (((channels_df['fee_ratio']/channels_df['ar_max_cost'])*1000)/10).round(0).astype(int)
@@ -1112,7 +1113,7 @@ def unprofitable_channels(request):
             stub = lnrpc.LightningStub(lnd_connect())
             current_block_height = stub.GetInfo(ln.GetInfoRequest()).block_height
         except Exception as e:
-            print(f"Error getting current block height: {e}")
+            logger.error(f'Error getting current block height: {str(e)}')
             current_block_height = 0 
 
         VERY_NEW_DAYS = 7
@@ -1349,7 +1350,7 @@ def unprofitable_channels(request):
 
                 except Exception as e:
                     # Handle potential errors during age calculation gracefully
-                    print(f"Error calculating age for chan_id {channel.chan_id}: {e}")
+                    logger.error(f'Error calculating age for chan_id {channel.chan_id}: {str(e)}')
                     channel_age_days = -1 # Indicate unknown age
             else:
                  channel_age_days = -1 # Indicate unknown age if block height or chan_id missing
@@ -1428,26 +1429,25 @@ def actions(request):
             result['auto_rebalance'] = channel.auto_rebalance
             result['ar_target'] = channel.ar_in_target
             if result['o7D'] > (result['i7D']*1.10) and result['outbound_percent'] > 75:
-                #print('Case 1: Pass')
-                continue
+                logger.debug('Auto-Enable Case 1: Pass')
             elif result['o7D'] > (result['i7D']*1.10) and result['inbound_percent'] > 75 and channel.auto_rebalance == False:
                 if channel.local_fee_rate <= channel.remote_fee_rate:
-                    #print('Case 6: Peer Fee Too High')
+                    logger.debug('Case 6: Peer Fee Too High')
                     result['output'] = 'Peer Fee Too High'
                     result['reason'] = 'o7D > i7D AND Inbound Liq > 75% AND Local Fee < Remote Fee'
                     continue
-                #print('Case 2: Enable AR')
+                logger.debug('Case 2: Enable AR - o7D > i7D AND Inbound Liq > 75%')
                 result['output'] = 'Enable AR'
                 result['reason'] = 'o7D > i7D AND Inbound Liq > 75%'
             elif result['o7D'] < (result['i7D']*1.10) and result['outbound_percent'] > 75 and channel.auto_rebalance == True:
-                #print('Case 3: Disable AR')
+                logger.debug('Case 3: Disable AR - o7D < i7D AND Outbound Liq > 75%')
                 result['output'] = 'Disable AR'
                 result['reason'] = 'o7D < i7D AND Outbound Liq > 75%'
             elif result['o7D'] < (result['i7D']*1.10) and result['inbound_percent'] > 75:
-                #print('Case 4: Pass')
+                logger.debug('Case 4: Pass')
                 continue
             else:
-                #print('Case 5: Pass')
+                logger.debug('Case 5: Pass')
                 continue
             if len(result) > 0:
                 action_list.append(result)
@@ -1724,7 +1724,7 @@ def batch_open(request):
                         channel_open.local_funding_amount = open['amt']
                         channels.append(channel_open)
                     response = stub.BatchOpenChannel(ln.BatchOpenChannelRequest(channels=channels, sat_per_vbyte=form.cleaned_data['fee_rate']))
-                    print(response)
+                    logger.debug(f'Batch open response: {response}')
                     messages.success(request, 'Batch opened channels!')
                 except Exception as e:
                     error = str(e)
@@ -2032,6 +2032,7 @@ def get_local_settings(*prefixes):
     if 'LND-' in prefixes:
         form.append({'unit': '', 'form_id': 'lnd_cleanPayments', 'value': 0, 'label': 'LND Clean Payments', 'id': 'LND-CleanPayments', 'title': 'Clean LND Payments (toggles failed payment clean-up routine)', 'min':0, 'max':1})
         form.append({'unit': 'days', 'form_id': 'lnd_retentionDays', 'value': 30, 'label': 'LND Retention', 'id': 'LND-RetentionDays', 'title': 'LND Retention days for failed payment data', 'min':1, 'max':1000})
+        form.append({'unit': 'min', 'form_id': 'lnd_reconnectInterval', 'value': 3, 'label': 'LND Reconnect Interval', 'id': 'LND-ReconnectInterval', 'title': 'Minimum minutes between reconnect attempts per inactive peer. Default 3', 'min':1, 'max':1440})
 
     for prefix in prefixes:
         ar_settings = LocalSettings.objects.filter(key__contains=prefix).values('key', 'value').order_by('key')
@@ -2074,6 +2075,7 @@ def update_settings(request):
                     #LND
                     {'form_id': 'lnd_cleanPayments', 'value': 0, 'parse': lambda x: int(x), 'id': 'LND-CleanPayments'},
                     {'form_id': 'lnd_retentionDays', 'value': 30, 'parse': lambda x: int(x), 'id': 'LND-RetentionDays'},
+                    {'form_id': 'lnd_reconnectInterval', 'value': 3, 'parse': lambda x: int(x), 'id': 'LND-ReconnectInterval'},
                     ]
 
         form = LocalSettingsForm(request.POST)
@@ -2502,7 +2504,7 @@ class PaymentsViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated] if settings.LOGIN_REQUIRED else []
     queryset = Payments.objects.all().order_by('-creation_date')
     serializer_class = PaymentSerializer
-    filterset_fields = {'status':['exact','lt','gt'], 'creation_date':['lte','gte'], 'chan_out': ['exact'], 'index': ['lt']}
+    filterset_fields = {'status':['exact','lt','gt'], 'creation_date':['lt','lte','gte'], 'chan_out': ['exact'], 'index': ['lt']}
 
 class PaymentHopsViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated] if settings.LOGIN_REQUIRED else []
@@ -2627,6 +2629,11 @@ class FailedHTLCViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = FailedHTLCs.objects.all().order_by('-id')
     serializer_class = FailedHTLCSerializer
     filterset_class = FailedHTLCFilter
+
+class HistFailedHTLCViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsAuthenticated] if settings.LOGIN_REQUIRED else []
+    queryset = HistFailedHTLC.objects.all().order_by('-id')
+    serializer_class = HistFailedHTLCSerializer
 
 class LocalSettingsViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated] if settings.LOGIN_REQUIRED else []
@@ -2776,14 +2783,15 @@ def get_channeldb_file_size():
 
             # Check for required settings
             if not host_value or not user_value:
-                print("Error: Remote file size enabled, but host or user is not set.")
+                logger.error('Error: Remote file size enabled, but host or user is not set')
                 return round(path.getsize(path.expanduser(settings.LND_DATABASE_PATH))*0.000000001, 3)
 
             # --- Paramiko logic ---
             try:
                 # Create SSH client
                 ssh = paramiko.SSHClient()
-                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # Automatically add host keys
+                ssh.load_system_host_keys()
+                ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
 
                 # Connect to the remote host (eg 10.1.1.2, lnd, 22)
                 ssh.connect(hostname=host_value, username=user_value, port=port)
@@ -2804,7 +2812,7 @@ def get_channeldb_file_size():
                 return round(file_size_bytes * 0.000000001, 3)
 
             except Exception as e:
-                print(f"Error retrieving file size with paramiko: {e}")
+                logger.error(f'Error retrieving file size with paramiko: {str(e)}')
                 return round(path.getsize(path.expanduser(settings.LND_DATABASE_PATH))*0.000000001, 3) # Fallback
             # --- End Paramiko logic ---
 
@@ -2814,7 +2822,7 @@ def get_channeldb_file_size():
 
     except Exception as e:
         # Handle exceptions
-        print(f"Error retrieving channel.db file size: {e}")
+        logger.error(f'Error retrieving channel.db file size: {str(e)}')
         return 0
 
 @api_view(['GET'])
@@ -3350,7 +3358,7 @@ def chan_policy(request):
                 stub = lnrpc.LightningStub(lnd_connect())
                 version = stub.GetInfo(ln.GetInfoRequest()).version
                 kwargs = {'chan_point':channel_point, 'base_fee_msat':base_fee_msat, 'fee_rate':fee_rate, 'time_lock_delta':time_lock_delta, 'min_htlc_msat_specified':True, 'min_htlc_msat':min_htlc_msat, 'max_htlc_msat':max_htlc_msat}
-                if serializer.validated_data['inbound_base_fee'] or serializer.validated_data['inbound_fee_rate']:
+                if serializer.validated_data['inbound_base_fee'] is not None or serializer.validated_data['inbound_fee_rate'] is not None:
                     if float(version[:4]) >= 0.18:
                         kwargs['inbound_fee'] = ln.InboundFee(base_fee_msat = inbound_base_fee_msat if inbound_base_fee_msat else 0, fee_rate_ppm = inbound_fee_rate if inbound_fee_rate else 0)
                     else:
@@ -3483,3 +3491,98 @@ def reset_api(request):
             return Response({'error': f'Error deleting table: {error}'})
     else:
         return Response({'error': serializer.error_messages})
+
+@is_login_required(login_required(login_url='/lndg-admin/login/?next=/'), settings.LOGIN_REQUIRED)
+def peer_offline_report(request):
+    # Timeframe is now fixed to Month to Date
+    # timeframe_options = {'MTD': 'Month to Date'} # No longer needed for a dropdown
+    # selected_timeframe = 'MTD' # Implied
+    
+    alias_filter_query = request.GET.get('alias', '').strip()
+    sort_by_query = request.GET.get('sort', '-total_offline_hours') 
+
+    now = timezone.now()
+    start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    peer_stats_list = []
+
+    open_channels = Channels.objects.filter(is_open=True)
+    if alias_filter_query:
+        open_channels = open_channels.filter(alias__icontains=alias_filter_query)
+
+    for channel in open_channels:
+        events = PeerEvents.objects.filter(
+            chan_id=channel.chan_id,
+            event='Connection',
+            timestamp__gte=start_date
+        ).order_by('timestamp')
+
+        if not events.exists() and not (alias_filter_query and channel.alias.lower().__contains__(alias_filter_query.lower())):
+            # Skip if no events and not specifically filtered for this alias (to show 0s)
+            continue
+
+        total_offline_duration_seconds = 0
+        offline_instance_count = 0
+        current_offline_start_time = None
+
+        for i, event in enumerate(events):
+            if event.new_value == 0:
+                if current_offline_start_time is None:
+                    current_offline_start_time = event.timestamp
+                    offline_instance_count += 1
+            elif event.new_value == 1:
+                if current_offline_start_time is not None:
+                    duration = event.timestamp - current_offline_start_time
+                    total_offline_duration_seconds += duration.total_seconds()
+                    current_offline_start_time = None
+
+        if current_offline_start_time is not None:
+            if not channel.is_active:
+                duration = now - current_offline_start_time
+                total_offline_duration_seconds += duration.total_seconds()
+
+        current_peer_stats = {
+            'chan_id': channel.chan_id,
+            'channel_alias': channel.alias,
+            'avg_offline_hours': 0,
+            'total_offline_hours': 0,
+            'offline_count': 0,
+            'currently_offline': not channel.is_active,
+        }
+
+        if offline_instance_count > 0:
+            avg_offline_hours = (total_offline_duration_seconds / offline_instance_count / 3600.0)
+            sum_offline_hours = total_offline_duration_seconds / 3600.0
+            current_peer_stats['avg_offline_hours'] = round(avg_offline_hours, 2)
+            current_peer_stats['total_offline_hours'] = round(sum_offline_hours, 2)
+            current_peer_stats['offline_count'] = offline_instance_count
+        
+        # Add to list if it had offline events OR if it was specifically filtered by alias (to show 0s)
+        if offline_instance_count > 0 or (alias_filter_query and channel.alias.lower().__contains__(alias_filter_query.lower())):
+            peer_stats_list.append(current_peer_stats)
+
+
+    # Python-side sorting for initial load / if JS is disabled / if alias filter is used
+    reverse_sort = sort_by_query.startswith('-')
+    # Use the part after '-' as the key, ensure it matches dict keys
+    sort_key = sort_by_query.lstrip('-') 
+    
+    def sort_helper(item):
+        val = item.get(sort_key)
+        if isinstance(val, bool):
+            return (val is False, val) if reverse_sort else (val is True, val) 
+        if isinstance(val, (int, float)):
+            return val
+        if val is None:
+            return float('-inf') if not reverse_sort else float('inf') 
+        return str(val).lower()
+
+    peer_stats_list.sort(key=sort_helper, reverse=reverse_sort)
+
+    context = {
+        'peer_stats': peer_stats_list,
+        'alias_filter_query': alias_filter_query,
+        'page_title': 'Peer Offline Report (Month to Date)', # Updated title
+        'active_menu': 'peer_offline_report',
+    }
+    return render(request, 'peer_offline_report.html', context)

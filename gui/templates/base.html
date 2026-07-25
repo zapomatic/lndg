@@ -14,7 +14,7 @@
       "capacity": ch => ({innerHTML: `<label>${ch.capacity.intcomma()}</label>
       <div class="progress w3-round w3-grey">
         <span class="value w3-round w3-blue" style="width:${ch.percent_outbound}%"></span>
-      </div>`}),
+      </div>`, title: formatDate(ch.last_update)}),
       "remote_balance": ch => ({innerHTML: `${ch.remote_balance.intcomma()} <small class="w3-round w3-border-small w3-border-grey">${ch.percent_inbound}%</small>`})
     }
     const routed_template = {
@@ -114,7 +114,7 @@
         <center><button id="toggleTheme" onclick="toggleTheme()">{% if request.COOKIES.darkmode == 'true' %}Light{%else%}Dark{% endif %} Theme</button></center>
       </div>
       <div class="w3-container w3-padding-small">
-        <center>LNDg v1.10.1</center>
+        <center>LNDg v1.11.0</center>
         <center><a href="{% url 'logout' %}">Logout</a></center>
       </div>
     </div>

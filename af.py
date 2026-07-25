@@ -47,7 +47,7 @@ def main(channels):
         lowliq_limit = int(LocalSettings.objects.filter(key='AF-LowLiqLimit').get().value)
     else:
         LocalSettings(key='AF-LowLiqLimit', value='15').save()
-        lowliq_limit = 5
+        lowliq_limit = 15
     if LocalSettings.objects.filter(key='AF-ExcessLimit').exists():
         excess_limit = int(LocalSettings.objects.filter(key='AF-ExcessLimit').get().value)
     else:
@@ -217,14 +217,14 @@ def main(channels):
 
     # Compute new outbound rates
     channels_df['new_rate'] = channels_df['local_fee_rate'] + channels_df['adjustment']
-    channels_df['new_rate'] = (channels_df['new_rate'] / increment).round(0) * increment
     channels_df['new_rate'] = channels_df['new_rate'].clip(min_rate, max_rate)
+    channels_df['new_rate'] = (channels_df['new_rate'] / increment).round(0) * increment
     channels_df['adjustment'] = channels_df['new_rate'] - channels_df['local_fee_rate']
 
     # Compute new inbound rates
     channels_df['new_inbound_rate'] = channels_df['local_inbound_fee_rate'] + channels_df['inbound_adjustment']
-    channels_df['new_inbound_rate'] = (channels_df['new_inbound_rate'] / increment).round(0) * increment
     channels_df['new_inbound_rate'] = channels_df['new_inbound_rate'].clip(-((channels_df['ar_max_cost']/100)*channels_df['local_fee_rate']), 0)
+    channels_df['new_inbound_rate'] = (channels_df['new_inbound_rate'] / increment).round(0) * increment
     channels_df['inbound_adjustment'] = channels_df['new_inbound_rate'] - channels_df['local_inbound_fee_rate']
 
     # Return results
